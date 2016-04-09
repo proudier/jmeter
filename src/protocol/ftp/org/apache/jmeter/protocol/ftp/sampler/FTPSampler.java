@@ -38,6 +38,7 @@ import org.apache.commons.io.output.NullOutputStream;
 import org.apache.commons.io.output.TeeOutputStream;
 import org.apache.commons.net.ftp.FTP;
 import org.apache.commons.net.ftp.FTPClient;
+import org.apache.commons.net.ftp.FTPFile;
 import org.apache.commons.net.ftp.FTPReply;
 import org.apache.jmeter.config.ConfigTestElement;
 import org.apache.jmeter.samplers.AbstractSampler;
@@ -69,6 +70,17 @@ public class FTPSampler extends AbstractSampler implements Interruptible {
 
     public static final String PORT = "FTPSampler.port"; // $NON-NLS-1$
 
+    // What do we want to do: upload, download, list?
+    public static final String COMMAND = "FTPSampler.command"; // $NON-NLS-1$
+    public static final String COMMAND_LIST = "LIST"; // $NON-NLS-1$
+    public static final String COMMAND_RETR = "RETR"; // $NON-NLS-1$
+    public static final String COMMAND_STOR = "STOR"; // $NON-NLS-1$
+
+    // This is the legacy, now obsolete 'upload' property. 
+    // Migration is handled in FtpConfigGui.modifyTestElement()
+    // Compatibility is ensured in the Sampler as well, allowing unmigrated tests to run
+    public static final String UPLOAD_FILE = "FTPSampler.upload"; // $NON-NLS-1$
+
     // N.B. Originally there was only one filename, and only get(RETR) was supported
     // To maintain backwards compatibility, the property name needs to remain the same
     public static final String REMOTE_FILENAME = "FTPSampler.filename"; // $NON-NLS-1$
@@ -77,11 +89,10 @@ public class FTPSampler extends AbstractSampler implements Interruptible {
 
     public static final String INPUT_DATA = "FTPSampler.inputdata"; // $NON-NLS-1$
 
+    public static final String REMOTE_DIRECTORY = "FTPSampler.remotedirectory"; // $NON-NLS-1$    
+
     // Use binary mode file transfer?
     public static final String BINARY_MODE = "FTPSampler.binarymode"; // $NON-NLS-1$
-
-    // Are we uploading?
-    public static final String UPLOAD_FILE = "FTPSampler.upload"; // $NON-NLS-1$
 
     // Should the file data be saved in the response?
     public static final String SAVE_RESPONSE = "FTPSampler.saveresponse"; // $NON-NLS-1$
@@ -119,6 +130,20 @@ public class FTPSampler extends AbstractSampler implements Interruptible {
         return getPropertyAsInt(PORT, 0);
     }
 
+    public String getCommand(){
+        // Compatibility with former property UPLOAD_FILE, now obsolete and replaced by COMMAND
+        if(getPropertyAsString(UPLOAD_FILE, new String()).length() > 0) {
+            final boolean upload = getPropertyAsBoolean(UPLOAD_FILE, false);
+            if(upload) {
+                return COMMAND_STOR;
+            } else {
+                return COMMAND_RETR;
+            }
+        } else {
+            return getPropertyAsString(COMMAND);
+        }
+    }
+
     public String getRemoteFilename() {
         return getPropertyAsString(REMOTE_FILENAME);
     }
@@ -131,16 +156,16 @@ public class FTPSampler extends AbstractSampler implements Interruptible {
         return getPropertyAsString(INPUT_DATA);
     }
 
+    private String getRemoteDirectory() {
+        return getPropertyAsString(REMOTE_DIRECTORY);
+    }
+
     public boolean isBinaryMode(){
         return getPropertyAsBoolean(BINARY_MODE,false);
     }
 
     public boolean isSaveResponse(){
         return getPropertyAsBoolean(SAVE_RESPONSE,false);
-    }
-
-    public boolean isUpload(){
-        return getPropertyAsBoolean(UPLOAD_FILE,false);
     }
 
 
@@ -160,10 +185,20 @@ public class FTPSampler extends AbstractSampler implements Interruptible {
             sb.append(port);
         }
         sb.append("/");// $NON-NLS-1$
-        sb.append(getRemoteFilename());
-        sb.append(isBinaryMode() ? " (Binary) " : " (Ascii) ");// $NON-NLS-1$ $NON-NLS-2$
-        sb.append(isUpload() ? " <- " : " -> "); // $NON-NLS-1$ $NON-NLS-2$
-        sb.append(getLocalFilename());
+        switch(getCommand()) {
+            case COMMAND_LIST:
+                sb.append(getRemoteDirectory());
+                sb.append(" ");
+                sb.append(COMMAND_LIST);
+                break;
+            case COMMAND_STOR:
+            case COMMAND_RETR:
+                sb.append(getRemoteFilename());
+                sb.append(isBinaryMode() ? " (Binary) " : " (Ascii) ");// $NON-NLS-1$ $NON-NLS-2$
+                sb.append(getCommand().equals(COMMAND_RETR) ? " <- " : " -> "); // $NON-NLS-1$ $NON-NLS-2$
+                sb.append(getLocalFilename());
+                break;
+        }
         return sb.toString();
     }
 
@@ -205,7 +240,9 @@ public class FTPSampler extends AbstractSampler implements Interruptible {
                     }
                     ftp.enterLocalPassiveMode();// should probably come from the setup dialog
                     boolean ftpOK=false;
-                    if (isUpload()) {
+
+                    switch(getCommand()) {
+                    case COMMAND_STOR:
                         String contents=getLocalFileContents();
                         if (contents.length() > 0){
                             byte[] bytes = contents.getBytes(); // TODO - charset?
@@ -217,7 +254,9 @@ public class FTPSampler extends AbstractSampler implements Interruptible {
                             input = new BufferedInputStream(new FileInputStream(infile));
                         }
                         ftpOK = ftp.storeFile(remote, input);
-                    } else {
+                        break;
+
+                    case COMMAND_RETR:
                         final boolean saveResponse = isSaveResponse();
                         ByteArrayOutputStream baos=null; // No need to close this
                         OutputStream target=null; // No need to close this
@@ -252,6 +291,38 @@ public class FTPSampler extends AbstractSampler implements Interruptible {
                                 res.setBytes((int) bytes);
                             }
                         }
+                        break;
+
+                    case COMMAND_LIST:
+                        FTPFile files[] = ftp.listFiles(getRemoteDirectory());
+                        if(files.length == 0) {
+                            // if not files were found, make sure the responseData are always
+                            // 2 and only 2 bytes, so that a SizeAssertion can be easilly used
+                            res.setResponseData("[]", "UTF-8");
+                        } else {
+                            StringBuilder sb = new StringBuilder();
+                            sb.append("[\n");
+                            for(FTPFile file : files) {
+                                sb.append("{ \"name\": \"");
+                                sb.append(file.getName());
+                                sb.append("\", \"size\": \"");
+                                sb.append(file.getSize());
+                                sb.append("\", \"isFile\": \"");
+                                sb.append(file.isFile());
+                                sb.append("\", \"isDirectory\": \"");
+                                sb.append(file.isDirectory());
+                                sb.append("\" },\n");
+                            }
+                            sb.setCharAt(sb.length()-2, ' ');
+                            sb.append("]\n");
+                            res.setResponseData(sb.toString(), "UTF-8");
+                        }
+                        ftpOK = true;
+                        break;
+
+                    default:
+                        log.error("Unsupported FTP command");
+                        break;
                     }
 
                     if (ftpOK) {
